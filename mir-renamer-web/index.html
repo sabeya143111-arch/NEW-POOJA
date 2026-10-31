@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIR Renamer</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b2430; --muted:#657080; --line:#e1e5ea; --accent:#1f5eff; --ok:#177a3c; --warn:#b45309; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --card:#1a2029; --ink:#e8ecf2; --muted:#93a0b2; --line:#2a3340; --accent:#5b8cff; --ok:#4cc27a; --warn:#f0a04b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .drop { border: 2px dashed var(--line); border-radius: 12px; background: var(--card); padding: 36px 16px; text-align: center; cursor: pointer; }
+  .drop.over { border-color: var(--accent); }
+  .drop b { color: var(--accent); }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; margin: 14px 0; color: var(--muted); font-size: 13px; }
+  table { width:100%; border-collapse: collapse; background: var(--card); border:1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 16px; }
+  th, td { text-align:left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  input, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+  input.ref { width: 100%; min-width: 250px; }
+  input.rev { width: 56px; }
+  button { font: inherit; border: 0; border-radius: 8px; padding: 8px 14px; background: var(--accent); color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .name { font-family: ui-monospace, Consolas, monospace; font-size: 13px; word-break: break-all; }
+  .flag { color: var(--warn); font-size: 12px; }
+  .bar { display:flex; gap: 12px; align-items:center; justify-content: space-between; margin-top: 14px; flex-wrap: wrap; }
+  #progress { color: var(--muted); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MIR Renamer</h1>
+  <p class="sub">Drop scanned MIR PDFs. Each page is read, then named <b>REF Rev.NN-STATUS.pdf</b>. Files are processed in your browser and are never uploaded.</p>
+
+  <label class="drop" id="drop">
+    <input id="file" type="file" accept="application/pdf" multiple class="hidden">
+    <div><b>Choose PDF files</b> or drop them here</div>
+  </label>
+
+  <div class="legend">
+    <span>Status codes: <b>A</b> = Approved, <b>AN</b> = Approved as Noted, <b>R</b> = third box (Rejected / Resubmit)</span>
+    <span>Check every row before downloading. Orange rows need your attention.</span>
+  </div>
+
+  <div class="bar">
+    <span id="progress"></span>
+    <button id="zip" class="hidden">Download all (ZIP)</button>
+  </div>
+
+  <table id="tbl" class="hidden">
+    <thead><tr><th>Source</th><th>Material submittal ref</th><th>Rev</th><th>Status</th><th>New file name</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="detect.js"></script>
+<script>
+// ---- settings: edit these codes if your company uses different ones ----
+const STATUS = ["A", "AN", "R"];      // box 1, box 2, box 3
+const SCALE = 200 / 72;               // render at 200 dpi (the detection is tuned for this)
+// -------------------------------------------------------------------------
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const $ = (id) => document.getElementById(id);
+const items = []; // { srcName, srcBytes, pageIndex, ref, rev, status, refFlag, statusFlag, errFlag }
+let worker;
+
+$("file").addEventListener("change", (e) => { handle([...e.target.files]); e.target.value = ""; });
+const drop = $("drop");
+["dragover", "dragenter"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => handle([...e.dataTransfer.files].filter((f) => /pdf$/i.test(f.name))));
+
+// run batches one after another so two drops never use the OCR worker at the same time
+let queue = Promise.resolve();
+const docCache = new Map(); // srcBytes -> PDFLib doc, so a multi-page file is parsed once
+
+function wordsOf(data) {
+  if (data.words) return data.words;
+  const out = [];
+  (data.blocks || []).forEach((b) => b.paragraphs.forEach((p) => p.lines.forEach((l) => l.words.forEach((w) => out.push(w)))));
+  return out;
+}
+
+function handle(files) {
+  if (!files.length) return;
+  queue = queue.then(() => process(files)).catch((err) => { $("progress").textContent = "Error: " + err.message; });
+}
+
+async function process(files) {
+  $("tbl").classList.remove("hidden");
+  if (!worker) { $("progress").textContent = "Loading OCR engine..."; worker = await Tesseract.createWorker("eng"); }
+  for (const f of files) {
+    let bytes, pdf;
+    try {
+      bytes = new Uint8Array(await f.arrayBuffer());
+      pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+    } catch (err) {
+      items.push({ srcName: f.name, srcBytes: null, pageIndex: 0, multi: false, ref: "", rev: 0, status: "", refFlag: "", statusFlag: "", errFlag: "Could not open this PDF: " + err.message });
+      render(); continue;
+    }
+    for (let p = 1; p <= pdf.numPages; p++) {
+      $("progress").textContent = `Reading ${f.name} - page ${p} of ${pdf.numPages}...`;
+      const item = { srcName: f.name, srcBytes: bytes, pageIndex: p - 1, multi: pdf.numPages > 1, ref: "", rev: 0, status: "", refFlag: "", statusFlag: "", errFlag: "" };
+      try {
+        const page = await pdf.getPage(p);
+        const vp = page.getViewport({ scale: SCALE });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+
+        const { data } = await worker.recognize(canvas, {}, { blocks: true, text: true });
+        const r = MIRDetect.findReference(data.text);
+        item.ref = r.ref || ""; item.rev = r.rev == null ? 0 : r.rev;
+        if (!r.ref) item.refFlag = "Reference not found - type it in.";
+
+        const ys = wordsOf(data).filter((w) => /^check/i.test(w.text.trim())).map((w) => w.bbox.y0);
+        if (ys.length) {
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const t = MIRDetect.findTickedBox(img.data, canvas.width, canvas.height, Math.max(...ys));
+          if (t.box != null) item.status = STATUS[t.box];
+          else item.statusFlag = "Status: " + t.note + " - choose it.";
+        } else item.statusFlag = "Status row not found - choose it.";
+        canvas.width = canvas.height = 0; // free the page bitmap
+      } catch (err) { item.errFlag = "Could not read this page: " + err.message; }
+      items.push(item);
+      render();
+    }
+  }
+  $("progress").textContent = "Done. Check the rows, then download.";
+}
+
+function newName(it) {
+  if (!it.ref) return "";
+  return `${it.ref} Rev.${String(it.rev).padStart(2, "0")}${it.status ? "-" + it.status : ""}.pdf`;
+}
+
+function render() {
+  const used = new Map();
+  $("rows").innerHTML = "";
+  items.forEach((it, i) => {
+    let name = newName(it);
+    if (name) { const n = (used.get(name) || 0) + 1; used.set(name, n); if (n > 1) name = name.replace(/\.pdf$/, ` (${n}).pdf`); }
+    it.finalName = name;
+    const flag = [it.errFlag, it.refFlag, it.statusFlag].filter(Boolean).join(" ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(it.srcName)}${it.multi ? "<br><span class='flag' style='color:var(--muted)'>page " + (it.pageIndex + 1) + "</span>" : ""}</td>
+      <td><input class="ref" value="${esc(it.ref)}"></td>
+      <td><input class="rev" type="number" min="0" value="${it.rev}"></td>
+      <td><select>${["", ...STATUS].map((s) => `<option ${s === it.status ? "selected" : ""} value="${s}">${s || "-"}</option>`).join("")}</select></td>
+      <td><div class="name">${esc(name) || "-"}</div>${flag ? `<div class="flag">${esc(flag)}</div>` : ""}</td>
+      <td><button class="ghost" ${name ? "" : "disabled"}>Download</button></td>`;
+    const [refI, revI] = tr.querySelectorAll("input"), sel = tr.querySelector("select");
+    refI.onchange = () => { it.ref = refI.value.trim().toUpperCase(); if (it.ref) it.refFlag = ""; render(); };
+    revI.onchange = () => { it.rev = Math.max(0, parseInt(revI.value || "0", 10)); render(); };
+    sel.onchange = () => { it.status = sel.value; if (it.status) it.statusFlag = ""; render(); };
+    tr.querySelector("button").onclick = async () => save(it.finalName, await pagePdf(it));
+    $("rows").appendChild(tr);
+  });
+  $("zip").classList.toggle("hidden", !items.some((it) => it.finalName));
+}
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function pagePdf(it) {
+  let src = docCache.get(it.srcBytes);
+  if (!src) { src = await PDFLib.PDFDocument.load(it.srcBytes, { ignoreEncryption: true }); docCache.set(it.srcBytes, src); }
+  const out = await PDFLib.PDFDocument.create();
+  const [pg] = await out.copyPages(src, [it.pageIndex]);
+  out.addPage(pg);
+  return await out.save();
+}
+
+function save(name, bytes) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes], { type: name.endsWith(".zip") ? "application/zip" : "application/pdf" }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+$("zip").onclick = async () => {
+  const zip = new JSZip();
+  for (const it of items) if (it.finalName) zip.file(it.finalName, await pagePdf(it));
+  save("MIR-renamed.zip", await zip.generateAsync({ type: "uint8array" }));
+};
+</script>
+</body>
+</html>
